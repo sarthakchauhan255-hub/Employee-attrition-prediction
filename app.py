@@ -5,6 +5,29 @@ Run:  streamlit run app.py
 Pre:  python model.py  (generates ./model_artifacts/)
 """
 
+# ── Self-healing dependency check ─────────────────────────
+# Streamlit Cloud sometimes ignores requirements.txt.
+# This ensures all packages exist before they are imported.
+import subprocess, sys as _sys
+
+def _ensure(pkg, import_as=None):
+    import importlib
+    try:
+        importlib.import_module(import_as or pkg)
+    except ImportError:
+        subprocess.check_call(
+            [_sys.executable, "-m", "pip", "install", pkg, "-q"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+_ensure("numpy")
+_ensure("pandas")
+_ensure("matplotlib")
+_ensure("seaborn")
+_ensure("scikit-learn", "sklearn")
+_ensure("scipy")
+# ──────────────────────────────────────────────────────────
+
 import os, pickle, warnings
 import numpy as np
 import pandas as pd
