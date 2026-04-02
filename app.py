@@ -46,14 +46,6 @@ C = dict(
     text3     = "#475569",
 )
 
-MPL = dict(
-    edgecolor=(1, 1, 1, 0.06),
-    grid=(1, 1, 1, 0.05),
-    legend_edge=(1, 1, 1, 0.08),
-    heatmap_line=(1, 1, 1, 0.03),
-    gauge_track=(1, 1, 1, 0.055),
-)
-
 # ══════════════════════════════════════════════════════════
 # GLOBAL CSS
 # ══════════════════════════════════════════════════════════
@@ -261,19 +253,19 @@ def mpl_dark():
     plt.rcParams.update({
         "figure.facecolor"  : "#0d1220",
         "axes.facecolor"    : "#0d1220",
-        "axes.edgecolor"    : MPL["edgecolor"],
+        "axes.edgecolor"    : "rgba(255,255,255,0.06)",
         "axes.labelcolor"   : "#64748b",
         "axes.titlecolor"   : "#f1f5f9",
         "axes.spines.top"   : False,
         "axes.spines.right" : False,
         "xtick.color"       : "#475569",
         "ytick.color"       : "#475569",
-        "grid.color"        : MPL["grid"],
+        "grid.color"        : "rgba(255,255,255,0.05)",
         "grid.linestyle"    : "-",
         "grid.linewidth"    : 0.5,
         "text.color"        : "#f1f5f9",
         "legend.facecolor"  : "#111827",
-        "legend.edgecolor"  : MPL["legend_edge"],
+        "legend.edgecolor"  : "rgba(255,255,255,0.08)",
         "legend.labelcolor" : "#94a3b8",
         "axes.labelsize"    : 9,
         "xtick.labelsize"   : 8,
@@ -310,37 +302,122 @@ OPTIONS = dict(
 
 
 # ══════════════════════════════════════════════════════════
-# LOAD ARTIFACTS & DATA
+# AUTO-TRAIN  (runs on Streamlit Cloud where no pkl exists)
 # ══════════════════════════════════════════════════════════
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                              f1_score, roc_auc_score, confusion_matrix,
+                              roc_curve, classification_report)
+from sklearn.utils.class_weight import compute_sample_weight
+
 @st.cache_resource(show_spinner=False)
-def load_artifacts():
+def get_model_and_data():
+    """
+    Load pre-trained artifacts if they exist (local dev),
+    otherwise train the model on-the-fly (Streamlit Cloud).
+    Results are cached so training only happens once per session.
+    """
     needed = ["model.pkl","label_encoders.pkl","feature_names.pkl","metrics.pkl"]
-    if any(not os.path.exists(os.path.join(ARTIFACT_DIR,f)) for f in needed):
-        return None,None,None,None
-    def _p(n):
-        with open(os.path.join(ARTIFACT_DIR,n),"rb") as f: return pickle.load(f)
-    return _p("model.pkl"),_p("label_encoders.pkl"),_p("feature_names.pkl"),_p("metrics.pkl")
+    artifacts_ready = all(os.path.exists(os.path.join(ARTIFACT_DIR,f)) for f in needed)
 
-@st.cache_data(show_spinner=False)
-def load_data():
-    return pd.read_csv(DATA_PATH) if os.path.exists(DATA_PATH) else None
+    # ── Load CSV ──────────────────────────────────────────
+    if not os.path.exists(DATA_PATH):
+        return None, None, None, None, None
 
-model, label_encoders, feature_names, metrics = load_artifacts()
-df_raw = load_data()
+    df_raw = pd.read_csv(DATA_PATH)
 
-if model is None or df_raw is None:
+    # ── Try loading pre-built artifacts ───────────────────
+    if artifacts_ready:
+        def _p(n):
+            with open(os.path.join(ARTIFACT_DIR,n),"rb") as f: return pickle.load(f)
+        return (df_raw,
+                _p("model.pkl"),
+                _p("label_encoders.pkl"),
+                _p("feature_names.pkl"),
+                _p("metrics.pkl"))
+
+    # ── Train from scratch (Streamlit Cloud path) ─────────
+    df = df_raw.copy()
+    df = df.drop(columns=[c for c in DROP_COLS if c in df.columns], errors="ignore")
+    df["Attrition"] = (df["Attrition"] == "Yes").astype(int)
+
+    label_encoders = {}
+    for col in CATEGORICAL_COLS:
+        le = LabelEncoder()
+        df[col] = le.fit_transform(df[col])
+        label_encoders[col] = le
+
+    X = df.drop("Attrition", axis=1)
+    y = df["Attrition"]
+    feature_names = X.columns.tolist()
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, random_state=42, stratify=y
+    )
+    sw = compute_sample_weight("balanced", y_train)
+
+    model = GradientBoostingClassifier(
+        n_estimators=300, learning_rate=0.05, max_depth=4,
+        subsample=0.8, min_samples_leaf=20, max_features="sqrt",
+        random_state=42,
+    )
+    model.fit(X_train, y_train, sample_weight=sw)
+
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+    fpr, tpr, _ = roc_curve(y_test, y_prob)
+    cv_scores    = cross_val_score(model, X_train, y_train, cv=5, scoring="accuracy")
+
+    metrics = dict(
+        accuracy   = accuracy_score(y_test, y_pred),
+        precision  = precision_score(y_test, y_pred),
+        recall     = recall_score(y_test, y_pred),
+        f1         = f1_score(y_test, y_pred),
+        roc_auc    = roc_auc_score(y_test, y_prob),
+        cm         = confusion_matrix(y_test, y_pred),
+        fpr=fpr, tpr=tpr,
+        report     = classification_report(y_test, y_pred, output_dict=True),
+        cv_mean    = cv_scores.mean(),
+        cv_std     = cv_scores.std(),
+        feature_names = feature_names,
+        importances   = model.feature_importances_,
+    )
+
+    # Save for subsequent runs if writable
+    try:
+        os.makedirs(ARTIFACT_DIR, exist_ok=True)
+        for fname, obj in [("model.pkl",model),("label_encoders.pkl",label_encoders),
+                            ("feature_names.pkl",feature_names),("metrics.pkl",metrics)]:
+            with open(os.path.join(ARTIFACT_DIR,fname),"wb") as f:
+                pickle.dump(obj, f)
+    except Exception:
+        pass  # read-only filesystem on Cloud — that's fine, cache keeps it in memory
+
+    return df_raw, model, label_encoders, feature_names, metrics
+
+
+# ── Spinner shown only on first load ──────────────────────
+spinner_ph = st.empty()
+with spinner_ph.container():
     st.markdown(f"""
-    <div style='min-height:80vh;display:flex;flex-direction:column;align-items:center;
-                justify-content:center;text-align:center;gap:1rem;padding:2rem;'>
-      <div style='font-size:4rem;animation:float 3s ease-in-out infinite;'>⚗️</div>
-      <div class='hero-title' style='font-size:2rem;'>Artifacts Not Found</div>
-      <div style='color:{C["text3"]};font-size:.95rem;max-width:440px;line-height:1.8;'>
-        Run <code style='color:{C["cyan"]};background:rgba(0,229,255,0.08);
-        padding:.1rem .4rem;border-radius:4px;'>python model.py</code> first
-        to train the model and generate <code style='color:{C["violet"]};'>model_artifacts/</code>
-      </div>
+    <div style='min-height:60vh;display:flex;flex-direction:column;
+                align-items:center;justify-content:center;gap:1rem;text-align:center;'>
+      <div style='font-size:3rem;'>⚗️</div>
+      <div style='font-family:"Outfit",sans-serif;font-size:1.4rem;font-weight:800;
+                  color:{C["cyan"]};'>Initialising AttritionIQ…</div>
+      <div style='color:{C["text3"]};font-size:.85rem;'>
+        Training model on first launch. This takes ~20 seconds.</div>
     </div>
     """, unsafe_allow_html=True)
+
+df_raw, model, label_encoders, feature_names, metrics = get_model_and_data()
+spinner_ph.empty()   # remove the spinner once done
+
+if df_raw is None:
+    st.error("Dataset CSV not found. Ensure `WA_Fn-UseC_-HR-Employee-Attrition.csv` "
+             "is committed to your repository.")
     st.stop()
 
 
@@ -460,7 +537,7 @@ if "Dashboard" in page:
             startangle=90, wedgeprops=dict(width=0.52,edgecolor="#0d1220",linewidth=3),
             pctdistance=0.76)
         for at in autotexts: at.set(color=C["text"],fontsize=13,fontweight="bold")
-        ax1.legend(handles=[mpatches.Patch(color=c, label=l) for c, l in zip(cols_p, vals.index)],
+        ax1.legend([mpatches.Patch(color=c,label=l) for c,l in zip(cols_p,vals.index)],
                    loc="lower center",ncol=2,frameon=False,fontsize=9,labelcolor=C["text2"])
         ax1.set_title("Overall Attrition",pad=14)
         st.pyplot(f1,use_container_width=True); plt.close()
@@ -608,7 +685,7 @@ elif "Model" in page:
         f1, ax1 = new_fig(5.2, 4.5)
         sns.heatmap(metrics["cm"],annot=True,fmt="d",cmap=CMAP_VIOLET,ax=ax1,
                     xticklabels=["Stay","Leave"],yticklabels=["Stay","Leave"],
-                    linewidths=3,linecolor=MPL["heatmap_line"],
+                    linewidths=3,linecolor="#080c14",
                     annot_kws={"fontsize":18,"fontweight":"bold","color":"white"})
         ax1.set_xlabel("Predicted"); ax1.set_ylabel("Actual")
         ax1.set_title("Confusion Matrix — Test Set",pad=12)
@@ -799,7 +876,7 @@ elif "Predict" in page:
             fg, axg = plt.subplots(figsize=(3.6,3.2),subplot_kw=dict(aspect="equal"))
             fg.patch.set_facecolor("#0d1220"); axg.set_facecolor("#0d1220")
             t = np.linspace(np.pi,0,300)
-            axg.plot(np.cos(t),np.sin(t),color=MPL["gauge_track"],lw=14,solid_capstyle="round")
+            axg.plot(np.cos(t),np.sin(t),color="rgba(255,255,255,0.055)",lw=14,solid_capstyle="round")
             fe = np.pi-prob*np.pi
             tf = np.linspace(np.pi,fe,300)
             gc = C["rose"] if prob>0.5 else C["emerald"]
